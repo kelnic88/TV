@@ -1,0 +1,166 @@
+name: Build Leanback TV APKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Sign and publish both TV APKs to Releases
+        type: boolean
+        default: true
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leanback-tv-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      build: ${{ steps.upstream.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags https://github.com/FongMi/TV.git refs/heads/fongmi
+          sha=$(git rev-parse FETCH_HEAD)
+          git push origin "$sha:refs/heads/upstream-fongmi"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          existing=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName,isDraft \
+            --jq '.[0] | select(.isDraft == false) | .tagName')
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch || "$existing" != "tv-$sha" ]]; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: FongMi/TV
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Restore matching upstream player libraries
+        env:
+          MPV_AAR_URL: ${{ vars.MPV_AAR_URL }}
+          MPV_AAR_SHA256: ${{ vars.MPV_AAR_SHA256 }}
+          FFMPEG_AAR_URL: ${{ vars.FFMPEG_AAR_URL }}
+          FFMPEG_AAR_SHA256: ${{ vars.FFMPEG_AAR_SHA256 }}
+        run: |
+          fetch_aar() {
+            local file="app/libs/$1" url="$2" hash="$3"
+            [[ ! -s "$file" ]] || return 0
+            if [[ "$url" != https://* || ! "$hash" =~ ^[a-fA-F0-9]{64}$ ]]; then
+              echo "::error file=app/build.gradle::Missing $file. Set the matching HTTPS AAR URL and SHA-256 in repository variables."
+              return 1
+            fi
+            curl --fail --silent --show-error --location --retry 3 --proto '=https' --proto-redir '=https' "$url" -o "$file"
+            printf '%s  %s\n' "$hash" "$file" | sha256sum --check --strict
+          }
+          failed=0
+          fetch_aar lib-mpvplayer-release.aar "$MPV_AAR_URL" "$MPV_AAR_SHA256" || failed=1
+          fetch_aar lib-decoder-ffmpeg-release.aar "$FFMPEG_AAR_URL" "$FFMPEG_AAR_SHA256" || failed=1
+          exit "$failed"
+      - name: Install Android SDK platform
+        run: |
+          sdk=$(sed -nE 's/^compileSdk = "([0-9]+)"$/\1/p' gradle/libs.versions.toml)
+          [[ "$sdk" =~ ^[0-9]+$ ]]
+          sdkmanager --install "platforms;android-$sdk" 'build-tools;36.0.0'
+      - name: Compile unsigned Leanback APKs
+        run: |
+          printf 'sdk.dir=%s\nstoreFile=unused.jks\nkeyAlias=unused\nstorePassword=unused\n' "$ANDROID_HOME" > local.properties
+          grep -q 'signingConfig = signingConfigs.release' app/build.gradle
+          sed -i 's/signingConfig = signingConfigs.release/signingConfig = null/' app/build.gradle
+          bash gradlew --no-daemon :app:exportLeanbackReleaseApks
+          mkdir -p apk-output
+          for abi in armeabi-v7a arm64-v8a; do
+            apk="Release/apk/leanback-$(echo "$abi" | tr '-' '_').apk"
+            test -s "$apk"
+            "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" > badging.txt
+            grep -Fq "package: name='com.fongmi.android.tv'" badging.txt
+            grep -Fxq "native-code: '$abi'" badging.txt
+            cp "$apk" "apk-output/leanback-$abi.apk"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leanback-unsigned
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [sync, build]
+    if: github.event_name == 'schedule' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: leanback-unsigned
+          path: unsigned
+      - name: Install Android signing tools
+        run: sdkmanager --install 'build-tools;36.0.0'
+      - name: Sign and verify both APKs
+        env:
+          TV_SIGNING_STORE: ${{ secrets.TV_SIGNING_STORE }}
+          TV_SIGNING_PASSWORD: ${{ secrets.TV_SIGNING_PASSWORD }}
+        run: |
+          : "${TV_SIGNING_STORE:?Set TV_SIGNING_STORE to the base64 PKCS12 keystore}"
+          : "${TV_SIGNING_PASSWORD:?Set TV_SIGNING_PASSWORD to the keystore password}"
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          umask 077
+          key="$RUNNER_TEMP/tv-signing.p12"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$TV_SIGNING_STORE" | base64 --decode > "$key"
+          mkdir signed
+          for abi in armeabi-v7a arm64-v8a; do
+            file="leanback-$abi.apk"
+            "$tools/zipalign" -P 16 -f 4 "unsigned/$file" "$RUNNER_TEMP/aligned.apk"
+            "$tools/apksigner" sign --ks "$key" --ks-type PKCS12 --ks-key-alias tv-release \
+              --ks-pass env:TV_SIGNING_PASSWORD --out "signed/$file" "$RUNNER_TEMP/aligned.apk"
+            "$tools/apksigner" verify --verbose --print-certs "signed/$file" | tee "signed/$abi.cert"
+          done
+          grep 'certificate SHA-256 digest:' signed/armeabi-v7a.cert > arm32.cert
+          grep 'certificate SHA-256 digest:' signed/arm64-v8a.cert > arm64.cert
+          cmp arm32.cert arm64.cert
+          (cd signed && sha256sum leanback-*.apk > SHA256SUMS.txt)
+      - name: Publish verified Leanback APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          tag="tv-$SOURCE_SHA"
+          if state=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft); then
+            if [[ "$state" == false ]]; then
+              echo "Release $tag is already published."
+              exit 0
+            fi
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --draft \
+              --title "Leanback TV APKs ${SOURCE_SHA:0:12}" \
+              --notes "Android TV only. Source: https://github.com/FongMi/TV/tree/$SOURCE_SHA"
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber signed/leanback-*.apk signed/SHA256SUMS.txt
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
